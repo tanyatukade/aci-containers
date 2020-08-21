@@ -28,6 +28,7 @@ import (
 	"github.com/sirupsen/logrus"
 	v1 "k8s.io/api/core/v1"
 	v1beta1 "k8s.io/api/discovery/v1beta1"
+	v1net "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
@@ -169,7 +170,16 @@ func (cont *AciController) queueNetPolForEpAddrs(addrs []v1.EndpointAddress) {
 		}
 		podkey := addr.TargetRef.Namespace + "/" + addr.TargetRef.Name
 		npkeys := cont.netPolEgressPods.GetObjForPod(podkey)
+		cont.log.Debug("Matches npkey: ", npkeys)
 		for _, npkey := range npkeys {
+			cont.log.Debug("Pod Matches: ", npkey)
+			netpolobj, exists, err := cont.networkPolicyIndexer.GetByKey(npkey)
+			if exists && err == nil {
+				cont.log.Debug("Pod Key: ", podkey)
+				np := netpolobj.(*v1net.NetworkPolicy)
+				ports := cont.getNetPolTargetPorts(np)
+				cont.updateTargetPortIndex(false, npkey, nil, ports)
+			}
 			cont.queueNetPolUpdateByKey(npkey)
 		}
 	}

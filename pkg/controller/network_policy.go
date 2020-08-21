@@ -36,6 +36,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
+	k8util "k8s.io/kubectl/pkg/util"
 
 	"github.com/noironetworks/aci-containers/pkg/apicapi"
 	"github.com/noironetworks/aci-containers/pkg/index"
@@ -513,29 +514,65 @@ func (cont *AciController) updateTargetPortIndex(service bool, key string,
 		}
 
 		if service {
+			cont.log.Debug("Update For Sevice: ", portkey)
 			entry.serviceKeys[key] = true
 		} else {
+			cont.log.Debug("Update For Network: ", portkey)
+			cont.log.Debug("Entry: ", entry)
 			entry.networkPolicyKeys[key] = true
 		}
 	}
 }
+func (cont *AciController) getPortNumberFromNpKey(npKey string, portName string) string {
+	podKeys := cont.netPolPods.GetPodForObj(npKey)
+	cont.log.Debug("podKeys: ", podKeys)
+	port := ""
+	for _, podkey := range podKeys {
+		cont.log.Debug("getPortNumberFromNpKey: ", podkey)
+		podobj, exists, err := cont.podIndexer.GetByKey(podkey)
+		if exists && err == nil {
+			pod := podobj.(*v1.Pod)
+			portnum, err := k8util.LookupContainerPortNumberByName(*pod, portName)
+			if err == nil {
+				port = strconv.Itoa(int(portnum))
+				return port
+			} else {
+				cont.log.Warning("There is no matching named "+
+					"port in network policy", err)
+
+			}
+		}
+	}
+	return port
+
+}
 
 // get a map of target ports for egress rules that have no "To" clause
-func getNetPolTargetPorts(np *v1net.NetworkPolicy) map[string]targetPort {
+func (cont *AciController) getNetPolTargetPorts(np *v1net.NetworkPolicy) map[string]targetPort {
 	ports := make(map[string]targetPort)
 	for _, egress := range np.Spec.Egress {
 		if len(egress.To) != 0 {
 			continue
 		}
 		for _, port := range egress.Ports {
-			if port.Port == nil || port.Port.Type != intstr.Int {
+			if port.Port == nil {
 				continue
 			}
 			proto := v1.ProtocolTCP
 			if port.Protocol != nil {
 				proto = *port.Protocol
 			}
-			key := portProto(&proto) + "-num-" + port.Port.String()
+			npKey, _ := cache.MetaNamespaceKeyFunc(np)
+			var val string
+			if port.Port.Type == intstr.Int {
+				val = port.Port.String()
+			} else {
+				val = cont.getPortNumberFromNpKey(npKey, port.Port.String())
+				if val == "" {
+					continue
+				}
+			}
+			key := portProto(&proto) + "-num-" + val
 			ports[key] = targetPort{
 				proto: proto,
 				port:  port.Port.IntValue(),
@@ -610,7 +647,7 @@ func buildNetPolSubjRule(subj apicapi.ApicObject, ruleName string,
 func (cont *AciController) buildNetPolSubjRules(ruleName string,
 	subj apicapi.ApicObject, direction string, peers []v1net.NetworkPolicyPeer,
 	remoteSubnets []string, ports []v1net.NetworkPolicyPort,
-	logger *logrus.Entry) {
+	logger *logrus.Entry, npKey string) {
 
 	if len(peers) > 0 && len(remoteSubnets) == 0 {
 		// nonempty From matches no pods or IPBlocks; don't
@@ -640,9 +677,31 @@ func (cont *AciController) buildNetPolSubjRules(ruleName string,
 					// an integer or a "named port on a pod".
 					// What does it mean for it to be a named
 					// port?  On what pod?
-					logger.Warning("Unsupported use of named " +
-						"port in network policy")
-					continue
+					podKeys := cont.netPolPods.GetPodForObj(npKey)
+					for _, podkey := range podKeys {
+						podobj, exists, err := cont.podIndexer.GetByKey(podkey)
+						if exists && err == nil {
+							pod := podobj.(*v1.Pod)
+							portnum, err := k8util.LookupContainerPortNumberByName(*pod, p.Port.String())
+							if err == nil {
+								port = strconv.Itoa(int(portnum))
+								//logger.Warning("Unsupported use of named " +
+								//		"port in network policy")
+								//continue
+								break
+							} else {
+								logger.Warning("There is no matching named "+
+									"port in network policy", err)
+
+								continue
+							}
+						}
+					}
+					if port == "" {
+						logger.Warning("There is no matching named " +
+							"port in network policy")
+						continue
+					}
 				}
 			}
 			if !cont.configuredPodNetworkIps.V4.Empty() {
@@ -837,14 +896,17 @@ func (cont *AciController) getServiceAugmentByPort(subj apicapi.ApicObject,
 	// nil port means it matches against all ports.  If we're here, it
 	// means this is a rule that matches all ports with all
 	// destinations, so there's no need to augment anything.
+	cont.log.Debug("getServiceAugmentByPort #####: ", prs)
 	if prs.port == nil ||
-		prs.port.Port == nil || prs.port.Port.Type != intstr.Int {
+		prs.port.Port == nil {
 		return
 	}
 
 	portkey := portKey(prs.port)
 	cont.indexMutex.Lock()
+	cont.log.Debug("PortKey: ", portkey)
 	entry, _ := cont.targetPortIndex[portkey]
+	cont.log.Debug("entry$$: ", entry)
 	if entry != nil {
 		for servicekey := range entry.serviceKeys {
 			serviceobj, _, err := cont.serviceIndexer.GetByKey(servicekey)
@@ -858,15 +920,27 @@ func (cont *AciController) getServiceAugmentByPort(subj apicapi.ApicObject,
 			}
 			service := serviceobj.(*v1.Service)
 
+			cont.log.Debug("Service Spec Ports#####: ", service.Spec.Ports)
 			for _, svcPort := range service.Spec.Ports {
-				if svcPort.Protocol != *prs.port.Protocol ||
-					svcPort.TargetPort.String() !=
-						prs.port.Port.String() {
+				if svcPort.Protocol != *prs.port.Protocol {
 					continue
 				}
-
+				cont.log.Debug("Service TargetPort: ", svcPort.TargetPort.String())
+				cont.log.Debug("Prs port string: ", prs.port.Port.String())
+				if svcPort.TargetPort.String() !=
+					prs.port.Port.String() {
+					cont.log.Debug("Service PortName #####: ", svcPort.Name)
+					if prs.port.Port.Type == intstr.String {
+						if svcPort.Name != prs.port.Port.String() {
+							continue
+						}
+					} else {
+						continue
+					}
+				}
 				proto := portProto(&svcPort.Protocol)
 				port := strconv.Itoa(int(svcPort.Port))
+				cont.log.Debug("Found Service PortName #####: ", svcPort.Name, port, proto)
 
 				updateServiceAugmentForService(portAugments,
 					proto, port, service)
@@ -923,9 +997,12 @@ func (cont *AciController) buildServiceAugment(subj apicapi.ApicObject,
 	portRemoteSubs map[string]*portRemoteSubnet, logger *logrus.Entry) {
 
 	portAugments := make(map[string]*portServiceAugment)
-
+	for key, prs := range portRemoteSubs {
+		cont.log.Debug("key: ", key, "buildServiceAugment  #####: ", prs)
+	}
 	for _, prs := range portRemoteSubs {
 		// TODO ipv6
+		cont.log.Debug("prs #####: ", prs)
 		if prs.subnetMap["0.0.0.0/0"] {
 			cont.getServiceAugmentByPort(subj, prs, portAugments, logger)
 		} else {
@@ -979,7 +1056,6 @@ func (cont *AciController) handleNetPolUpdate(np *v1net.NetworkPolicy) bool {
 			if _, nsok := peerNs[pod.ObjectMeta.Namespace]; !nsok {
 				nsobj, exists, err :=
 					cont.namespaceIndexer.GetByKey(pod.ObjectMeta.Namespace)
-
 				if !exists || err != nil {
 					continue
 				}
@@ -1004,7 +1080,7 @@ func (cont *AciController) handleNetPolUpdate(np *v1net.NetworkPolicy) bool {
 			remoteSubnets, _ := cont.getPeerRemoteSubnets(ingress.From,
 				np.Namespace, peerPods, peerNs, logger)
 			cont.buildNetPolSubjRules(strconv.Itoa(i), subjIngress,
-				"ingress", ingress.From, remoteSubnets, ingress.Ports, logger)
+				"ingress", ingress.From, remoteSubnets, ingress.Ports, logger, key)
 		}
 		hpp.AddChild(subjIngress)
 	}
@@ -1020,7 +1096,7 @@ func (cont *AciController) handleNetPolUpdate(np *v1net.NetworkPolicy) bool {
 			remoteSubnets, subnetMap := cont.getPeerRemoteSubnets(egress.To,
 				np.Namespace, peerPods, peerNs, logger)
 			cont.buildNetPolSubjRules(strconv.Itoa(i), subjEgress,
-				"egress", egress.To, remoteSubnets, egress.Ports, logger)
+				"egress", egress.To, remoteSubnets, egress.Ports, logger, key)
 
 			// creating a rule to egress to all on a given port needs
 			// to enable access to any service IPs/ports that have
@@ -1031,9 +1107,29 @@ func (cont *AciController) handleNetPolUpdate(np *v1net.NetworkPolicy) bool {
 				}
 			}
 			for _, p := range egress.Ports {
-				portkey := portKey(&p)
-				updatePortRemoteSubnets(portRemoteSubs, portkey, &p, subnetMap,
-					p.Port != nil && p.Port.Type == intstr.Int)
+				var port intstr.IntOrString
+				if p.Port != nil && p.Port.Type == intstr.Int {
+					port = *p.Port
+				} else if p.Port != nil && p.Port.Type == intstr.String {
+					port.Type = intstr.Int
+					intval, _ := strconv.Atoi(cont.getPortNumberFromNpKey(key, p.Port.String()))
+					port.IntVal = int32(intval)
+					if intval == 0 {
+						continue
+					}
+				}
+				portnew := &v1net.NetworkPolicyPort{
+					Protocol: p.Protocol,
+					Port:     &port,
+				}
+				portkey := portKey(portnew)
+				cont.log.Debug("PortKey: ", portkey)
+				updatePortRemoteSubnets(portRemoteSubs, portkey, portnew, subnetMap,
+					p.Port != nil)
+				cont.log.Debug("updatePortRemoteSubnets: ", portRemoteSubs, portkey)
+			}
+			for key, prs := range portRemoteSubs {
+				cont.log.Debug("portRemoteSubnets #####: ", prs.port, "key: ", key)
 			}
 			if len(egress.Ports) == 0 {
 				updatePortRemoteSubnets(portRemoteSubs, "", nil, subnetMap,
@@ -1070,18 +1166,18 @@ func (cont *AciController) networkPolicyAdded(obj interface{}) {
 		return
 	}
 
+	cont.netPolPods.UpdateSelectorObj(obj)
+	cont.netPolIngressPods.UpdateSelectorObj(obj)
+	cont.netPolEgressPods.UpdateSelectorObj(obj)
 	cont.writeApicNP(npkey, np)
 	cont.indexMutex.Lock()
 	subnets := getNetworkPolicyEgressIpBlocks(np)
 	cont.updateIpIndex(cont.netPolSubnetIndex, nil, subnets, npkey)
 
-	ports := getNetPolTargetPorts(np)
+	ports := cont.getNetPolTargetPorts(np)
 	cont.updateTargetPortIndex(false, npkey, nil, ports)
 	cont.indexMutex.Unlock()
 
-	cont.netPolPods.UpdateSelectorObj(obj)
-	cont.netPolIngressPods.UpdateSelectorObj(obj)
-	cont.netPolEgressPods.UpdateSelectorObj(obj)
 	cont.queueNetPolUpdateByKey(npkey)
 }
 
@@ -1186,8 +1282,8 @@ func (cont *AciController) networkPolicyChanged(oldobj interface{},
 	newSubnets := getNetworkPolicyEgressIpBlocks(newnp)
 	cont.updateIpIndex(cont.netPolSubnetIndex, oldSubnets, newSubnets, npkey)
 
-	oldPorts := getNetPolTargetPorts(oldnp)
-	newPorts := getNetPolTargetPorts(newnp)
+	oldPorts := cont.getNetPolTargetPorts(oldnp)
+	newPorts := cont.getNetPolTargetPorts(newnp)
 	cont.updateTargetPortIndex(false, npkey, oldPorts, newPorts)
 	cont.indexMutex.Unlock()
 
@@ -1244,7 +1340,7 @@ func (cont *AciController) networkPolicyDeleted(obj interface{}) {
 	subnets := getNetworkPolicyEgressIpBlocks(np)
 	cont.updateIpIndex(cont.netPolSubnetIndex, subnets, nil, npkey)
 
-	ports := getNetPolTargetPorts(np)
+	ports := cont.getNetPolTargetPorts(np)
 	cont.updateTargetPortIndex(false, npkey, ports, nil)
 	cont.indexMutex.Unlock()
 
@@ -1270,11 +1366,19 @@ func (sep *serviceEndpoint) SetNpServiceAugmentForService(servicekey string, ser
 
 	for _, svcPort := range service.Spec.Ports {
 		if prs.port != nil &&
-			(svcPort.Protocol != *prs.port.Protocol ||
-				svcPort.TargetPort.String() !=
-					prs.port.Port.String()) {
+			(svcPort.Protocol != *prs.port.Protocol) {
 			// egress rule does not match service target port
 			continue
+		} else if prs.port != nil && svcPort.TargetPort.String() !=
+			prs.port.Port.String() {
+			cont.log.Debug("Service PortName #####: ", svcPort.Name)
+			if !prs.hasNamedTarget {
+				continue
+			}
+			if svcPort.Name != prs.port.Port.String() {
+				continue
+			}
+			cont.log.Debug("Found Service PortName #####: ", svcPort.Name)
 		}
 		for _, subset := range endpoints.Subsets {
 			var foundEpPort *v1.EndpointPort

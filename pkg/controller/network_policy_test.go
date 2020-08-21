@@ -545,6 +545,27 @@ func TestNetworkPolicy(t *testing.T) {
 			makeNp(apicapi.ApicSlice{rule_8_0, rule_8_1}, nil, name),
 			nil, "multiple-from"},
 		{netpol("testns", "np1", &metav1.LabelSelector{},
+			[]v1net.NetworkPolicyIngressRule{
+				ingressRule([]v1net.NetworkPolicyPort{
+					{
+						Port: &intstr.IntOrString{Type: intstr.String, StrVal: "serve-80"},
+					},
+				}, []v1net.NetworkPolicyPeer{
+					peer(&metav1.LabelSelector{
+						MatchLabels: map[string]string{"l1": "v1"},
+					}, nil),
+				}),
+				ingressRule([]v1net.NetworkPolicyPort{
+					port(nil, &port443),
+				}, []v1net.NetworkPolicyPeer{
+					peer(&metav1.LabelSelector{
+						MatchLabels: map[string]string{"l1": "v2"},
+					}, nil),
+				}),
+			}, nil, allPolicyTypes),
+			makeNp(apicapi.ApicSlice{rule_8_0, rule_8_1}, nil, name),
+			nil, "multiple-from-name"},
+		{netpol("testns", "np1", &metav1.LabelSelector{},
 			nil, []v1net.NetworkPolicyEgressRule{
 				egressRule(nil,
 					[]v1net.NetworkPolicyPeer{
